@@ -1,73 +1,188 @@
 #!/usr/bin/env bash
-# X1300 (TC358743) → CSI-2 → RP1-CFE (Raspberry Pi 5, X11)
-# Fest: CSI-Pads auf RGB888, Video-Node auf RGB3 (Bytes sind BGR → bgr24 anschauen)
+# X1300 / TC358743 Setup für OpenCV (Pi 5, Raspberry Pi OS/X11, kein GStreamer)
+# - Setzt EDID (pad=0), liest DV-Timings
+# - Verlinkt Media-Graph (csi2:4 -> rp1-cfe-csi2_ch0:0)
+# - BUS-Format auf RGB888_1X24 (CSI), Video-Node auf BGR3 (24 bpp)
+# Quellen/Anlehnung: Geekworm X1300 (Pi 5) + v4l2-ctl EDID pad=0
 
 set -Eeuo pipefail
-log(){ echo "[X1300] $*"; }
-die(){ echo "[X1300][FATAL] $*" >&2; exit 1; }
-trap 'die "Abbruch in Zeile $LINENO."' ERR
+export LC_ALL=C LANG=C
 
-[[ "${1:-}" == "--preview" ]] && PREVIEW=1 || PREVIEW=0
+# --------- Styling (ohne Funktionssyntax) ----------
+if [ -t 1 ]; then
+  BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; YEL=$'\e[33m'; GRN=$'\e[32m'; CLR=$'\e[0m'
+else
+  BOLD=""; DIM=""; RED=""; YEL=""; GRN=""; CLR=""
+fi
+sec() { printf "\n${BOLD}%s${CLR}\n" "$*"; }
+ok()  { printf "${GRN}[OK]${CLR} %s\n" "$*"; }
+warn(){ printf "${YEL}[WARN]${CLR} %s\n" "$*"; }
+err() { printf "${RED}[FATAL]${CLR} %s\n" "$*"; }
 
-case "$(uname -r)" in 6.12*) log "WARN: Kernel 6.12.x macht mit TC358743 öfter Ärger; 6.6.x läuft stabiler."; ;; esac
+# --------- Optionen ----------
+EDID_FILE="${EDID_FILE:-/tmp/X1300_EDID_1080P60.txt}"
+RETRIES="${RETRIES:-4}"
+SLEEP_S="${SLEEP_S:-0.3}"
+ENV_OUT="${ENV_OUT:-/tmp/x1300_env}"
+MD_LIMIT="${MD_LIMIT:-160}"
 
-# 0) Leser schließen (V4L2 meist Single-Reader)
-for n in /dev/video* /dev/v4l-subdev* /dev/media*; do sudo fuser -kv "$n" >/dev/null 2>&1 || true; done
+# --------- Kernelinfo ----------
+KREL="$(uname -r || true)"
+sec "[X1300] Kernel: $KREL"
+[[ "$KREL" =~ ^6\.12\. ]] && warn "Kernel 6.12.x auf Pi 5 ist für TC358743 anfällig. 6.6.x läuft stabiler."
 
-# 1) rp1-cfe Media-Device finden
+# --------- Geräte finden ----------
+SUBDEV=""
+for p in /sys/class/video4linux/v4l-subdev*; do
+  [[ -r "$p/name" ]] || continue
+  if grep -qi '^tc358743' "$p/name"; then SUBDEV="/dev/$(basename "$p")"; break; fi
+done
+[[ -n "$SUBDEV" ]] || { err "tc358743-Subdev nicht gefunden (Overlay/Verkabelung)."; exit 1; }
+
 MD=""
-for m in /dev/media*; do sudo media-ctl -d "$m" -p 2>/dev/null | grep -q "rp1-cfe" && { MD="$m"; break; }; done
-[[ -n "$MD" ]] || die "rp1-cfe Media-Device nicht gefunden."
+for m in /dev/media*; do
+  [[ -e "$m" ]] || continue
+  if media-ctl -d "$m" -p 2>/dev/null | grep -Fq "device node name $SUBDEV"; then MD="$m"; break; fi
+done
+[[ -n "$MD" ]] || { err "Kein /dev/mediaN referenziert $SUBDEV."; exit 1; }
 
-# 2) Subdev (tc358743) + Video-Node (rp1-cfe-csi2_ch0) ermitteln
-SUBDEV=""; for s in /dev/v4l-subdev*; do n="/sys/class/video4linux/$(basename "$s")/name"; [[ -f "$n" ]] && grep -q "^tc358743" "$n" && { SUBDEV="$s"; break; }; done
-[[ -n "$SUBDEV" ]] || die "tc358743 Subdev fehlt."
-VID=""; for v in /dev/video*; do n="/sys/class/video4linux/$(basename "$v")/name"; [[ -f "$n" ]] && grep -q "rp1-cfe-csi2_ch0" "$n" && { VID="$v"; break; }; done
-[[ -n "$VID" ]] || die "rp1-cfe-csi2_ch0 Video-Node fehlt."
+VID=""
+for v in /dev/video*; do
+  n="/sys/class/video4linux/$(basename "$v")/name"
+  [[ -r "$n" ]] || continue
+  if grep -qi 'rp1-cfe-csi2_ch0' "$n"; then VID="$v"; break; fi
+done
+VID="${VID:-/dev/video0}"
 
-log "Media : $MD"
-log "Subdev: $SUBDEV (tc358743)"
-log "Video : $VID   (rp1-cfe-csi2_ch0)"
+printf "%s\n" "------------------------------------------------------------"
+echo "[X1300] Media: $MD"
+echo "[X1300] Subdev: $SUBDEV"
+echo "[X1300] Video:  $VID"
+printf "%s\n" "------------------------------------------------------------"
 
-# 3) DV-Timings vom HDMI-Sender übernehmen (ggf. Fallback)
-if ! sudo v4l2-ctl -d "$SUBDEV" --set-dv-bt-timings=query >/dev/null 2>&1; then
-  log "Kein Handshake → setze 1080p60 & re-query."
-  sudo v4l2-ctl -d "$SUBDEV" --set-dv-bt-timings=cea-1920x1080-60 >/dev/null 2>&1 || true
-  sudo v4l2-ctl -d "$SUBDEV" --set-dv-bt-timings=query >/dev/null 2>&1 || die "Weiter kein HDMI-Signal."
-fi
-W=$(sudo v4l2-ctl -d "$SUBDEV" --query-dv-timings | awk '/Active width/{print $3}')
-H=$(sudo v4l2-ctl -d "$SUBDEV" --query-dv-timings | awk '/Active height/{print $3}')
-[[ "$W" != "0" && "$H" != "0" ]] || die "DV-Timings 0x0 → Quelle sendet nichts."
-log "dv.current: ${W}x${H}"
-
-# 4) Media-Graph reset + Link setzen
-sudo media-ctl -d "$MD" -r
-sudo media-ctl -d "$MD" -l "'csi2':4 -> 'rp1-cfe-csi2_ch0':0 [1]"
-
-# Bridge-Entity-Namen (für tc358743:0) extrahieren
-BR="$(sudo media-ctl -d "$MD" -p | sed -n "s/.*entity .*: \(tc358743 [^)]*\)).*/\1/p" | head -n1 | sed 's/)$//')"
-[[ -n "$BR" ]] || BR="tc358743 11-000f"
-
-# 5) CSI auf RGB888 drehen (wie Geekworm-Doku) – Pads: Bridge:0, csi2:0 (Sink), csi2:4 (Source)
-#    Eventuelles 'Invalid argument (22)' an nicht betroffenen Pads ist kosmetisch → ignorieren.
-sudo media-ctl -d "$MD" -V "'$BR':0  [fmt:RGB888_1X24/${W}x${H} field:none colorspace:srgb]" || true
-sudo media-ctl -d "$MD" -V "'csi2':0  [fmt:RGB888_1X24/${W}x${H} field:none colorspace:srgb]"
-sudo media-ctl -d "$MD" -V "'csi2':4  [fmt:RGB888_1X24/${W}x${H} field:none colorspace:srgb]"
-
-# 6) Video-Node auf RGB3 (Achtung: Bytes sind BGR-Reihenfolge → bgr24)
-sudo v4l2-ctl -d "$VID" --set-fmt-video=width=${W},height=${H},pixelformat=RGB3
-
-# 7) Smoketest
-sudo v4l2-ctl -d "$VID" --stream-mmap=4 --stream-count=60 --stream-to=/dev/null >/dev/null
-log "Stream OK @ ${W}x${H} RGB3 (bgr24 interpretieren)."
-
-# 8) Optionale Preview über Pipe (robust, kein direkter v4l2src)
-if [[ "$PREVIEW" -eq 1 ]]; then
-  command -v ffplay >/dev/null 2>&1 || die "ffplay fehlt (sudo apt install ffmpeg)."
-  log "Preview – <q> beendet."
-  exec sudo v4l2-ctl -d "$VID" --stream-mmap=4 --stream-to=- --stream-count=0 2>/dev/null | \
-       ffplay -hide_banner -loglevel warning -fflags nobuffer -flags low_delay \
-              -f rawvideo -pixel_format bgr24 -video_size ${W}x${H} -framerate 60 -i -
+# --------- EDID-Datei (1080p60) ----------
+if [ ! -s "$EDID_FILE" ]; then
+  cat > "$EDID_FILE" <<'EOF'
+00ffffffffffff005262888800888888
+1c150103800000780aEE91A3544C9926
+0F505400000001010101010101010101
+010101010101011d007251d01e206e28
+5500c48e2100001e8c0ad08a20e02d10
+103e9600138e2100001e000000fc0054
+6f73686962612d4832430a20000000FD
+003b3d0f2e0f1e0a202020202020014f
+020322444f841303021211012021223c
+3d3e101f2309070766030c00300080E3
+007F8c0ad08a20e02d10103e9600c48e
+210000188c0ad08a20e02d10103e9600
+138e210000188c0aa01451f01600267c
+4300138e210000980000000000000000
+00000000000000000000000000000000
+00000000000000000000000000000015
+EOF
+  ok "EDID geschrieben: $EDID_FILE"
 fi
 
-log "Fertig. Device: $VID  Format: RGB3  (in Apps als bgr24 behandeln)."
+# --------- EDID setzen (pad=0) ----------
+sec "[X1300] >> v4l2-ctl --set-edid"
+v4l2-ctl -d "$SUBDEV" --clear-edid 0 >/dev/null 2>&1 || true
+if ! v4l2-ctl -d "$SUBDEV" --set-edid=pad=0,file="$EDID_FILE",format=hex --fix-edid-checksums >/dev/null 2>&1; then
+  # Fallback ältere v4l2-utils
+  v4l2-ctl -d "$SUBDEV" --set-edid="file=$EDID_FILE" --fix-edid-checksums >/dev/null 2>&1 || true
+fi
+v4l2-ctl -d "$SUBDEV" --info-edid 0 2>/dev/null | sed -n '1,60p' || true
+
+# --------- DV-Timings mehrfach abfragen ----------
+W=0; H=0
+for i in $(seq 1 "$RETRIES"); do
+  sleep "$SLEEP_S"
+  if v4l2-ctl -d "$SUBDEV" --query-dv-timings >/tmp/_dv 2>&1; then
+    W=$(awk -F': *' '/Active width/ {print $2}' /tmp/_dv | head -n1)
+    H=$(awk -F': *' '/Active height/ {print $2}' /tmp/_dv | head -n1)
+    W=${W:-0}; H=${H:-0}
+  fi
+  [[ "$W" -gt 0 && "$H" -gt 0 ]] && break
+  echo "[X1300] DV retry $i/$RETRIES … (Quelle auf 1080p60 stellen/umschalten)"
+done
+
+if [[ "$W" -eq 0 || "$H" -eq 0 ]]; then
+  printf "%s\n" "------------------------------------------------------------"
+  echo "[X1300] DV current: 0x0"
+  cat /tmp/_dv || true
+  printf "%s\n" "------------------------------------------------------------"
+  echo "[X1300] Subdev --all (HDMI-Presence):"
+  v4l2-ctl -d "$SUBDEV" --all 2>/dev/null | sed -n '/Digital Video Controls/,+12p' || true
+  err "Kein gültiges HDMI-Signal (DV=0x0). EDID/HPD/Quelle/Kabel prüfen."
+  exit 2
+else
+  echo "[X1300] DV current: ${W}x${H}"
+  sed -n '1,30p' /tmp/_dv
+fi
+
+# Bestätigen (üblich in den Guides)
+v4l2-ctl -d "$SUBDEV" --set-dv-bt-timings query >/dev/null 2>&1 || true
+
+# --------- Media-Graph setzen ----------
+BUS_CODE="RGB888_1X24"
+ENTITY_NAME="$(media-ctl -d "$MD" -p | awk '/- entity .*tc358743/ {sub(/.*: /,""); print; exit}')"
+ENTITY_NAME="${ENTITY_NAME:-tc358743 11-000f}"
+
+printf "%s\n" "------------------------------------------------------------"
+echo "[X1300] Entity: ${ENTITY_NAME}"
+echo "[X1300] BUS-Code (tc358743:0) = ${BUS_CODE}"
+printf "%s\n" "------------------------------------------------------------"
+echo "[X1300] Setze Link & csi2-Pad-Formate (BUS=${BUS_CODE}, Size=${W}x${H})…"
+
+media-ctl -d "$MD" -r >/dev/null 2>&1 || true
+media-ctl -d "$MD" -l "'csi2':4 -> 'rp1-cfe-csi2_ch0':0 [1]" || true
+media-ctl -d "$MD" -V "'csi2':0 [fmt:${BUS_CODE}/${W}x${H} field:none colorspace:srgb]" || true
+media-ctl -d "$MD" -V "'csi2':4 [fmt:${BUS_CODE}/${W}x${H} field:none colorspace:srgb]" || true
+
+sec "Topologie (relevante Zeilen inkl. Links & Formaten):"
+media-ctl -d "$MD" -p | awk '
+/- entity .*tc358743/ || /- entity .*csi2/ || /rp1-cfe-csi2_ch0/ {print; show=1; next}
+show && /pad[0-9]:/ {print}
+show && /->/ {print}
+' | sed -n "1,${MD_LIMIT}p" || true
+
+# Achtung: Pattern beginnt mit '-' → grep nach '--'
+if ! media-ctl -d "$MD" -p | grep -Fq -- '-> "rp1-cfe-csi2_ch0":0 [ENABLED]'; then
+  err "Link csi2:4 -> rp1-cfe-csi2_ch0:0 ist NICHT enabled."
+  exit 3
+fi
+
+# --------- Video-Node auf BGR3 ----------
+printf "%s\n" "------------------------------------------------------------"
+echo "[X1300] Video-Node auf BGR3 ${W}x${H} setzen…"
+v4l2-ctl -d "$VID" -v width="$W",height="$H",pixelformat=BGR3 >/dev/null 2>&1 || true
+echo "[X1300] --get-fmt-video:"; v4l2-ctl -d "$VID" --get-fmt-video || true
+echo "[X1300] --list-formats-ext (Auszug):"; v4l2-ctl -d "$VID" --list-formats-ext | sed -n '1,120p' || true
+
+# --------- 2-Frame-Test ----------
+printf "%s\n" "------------------------------------------------------------"
+echo "[X1300] 2-Frame-Test (BGR3, verbose)…"
+if v4l2-ctl --verbose -d "$VID" --stream-mmap=4 --stream-count=2 --stream-to=/dev/null --stream-poll >/dev/null 2>&1; then
+  ok "Streamtest OK."
+else
+  warn "STREAMON fehlgeschlagen – meist Pad/BUS-Mismatch oder Kernel 6.12-Bug."
+  sec "[X1300] dmesg (tc358743|csi|rp1-cfe, letzte 80 Zeilen):"
+  dmesg | grep -Ei 'tc358743|csi|rp1-cfe' | tail -n 80 || true
+  err "Streaming-Start gescheitert."
+  exit 4
+fi
+
+# --------- ENV-Datei für Python ----------
+cat > "$ENV_OUT" <<EOF
+VIDEO_NODE=$VID
+WIDTH=$W
+HEIGHT=$H
+PIXELFORMAT=BGR3
+EOF
+
+sec "[X1300] Setup OK."
+echo "[X1300]   Media     : $MD"
+echo "[X1300]   Subdev    : $SUBDEV"
+echo "[X1300]   VideoNode : $VID"
+echo "[X1300]   Size/Pix  : ${W}x${H} BGR3"
+echo "[X1300]   Env       : $ENV_OUT"
+exit 0
