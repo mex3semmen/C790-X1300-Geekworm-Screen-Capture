@@ -33,7 +33,7 @@ dtoverlay=tc358743-audio
 # VC4 driver and memory
 dtoverlay=vc4-kms-v3d,cma-512
 media-controller=1
-gpu_mem=1024
+gpu_mem=256
 ```
 
 ## Verwendung
