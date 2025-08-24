@@ -1,4 +1,4 @@
-# C790 & X1300 HDMI to CSI-2 Capture on Raspberry Pi 5
+# C790 & X1300 HDMI to CSI-2 Capture on Raspberry Pi 5 (1080p60hz)
 
 Dieses Repository demonstriert Live-Capture einer HDMI-Quelle – z.B. eines Desktop-PCs – über die Geekworm X1300 (TC358743) nach CSI-2 auf einen Raspberry Pi 5 mit Raspberry Pi OS (X11).
 
