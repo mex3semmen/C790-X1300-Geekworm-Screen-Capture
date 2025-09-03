@@ -4,6 +4,8 @@ Dieses Repository demonstriert Live-Capture einer HDMI-Quelle – z.B. eines Des
 
 Die Capture-Pipeline wird über ein Shell-Skript vorbereitet und anschließend mit einem kurzen Python-Programm geöffnet.
 
+50ms Latenz.
+
 ## Voraussetzungen
 
 - Raspberry Pi 5 mit Raspberry Pi OS (X11)
@@ -28,12 +30,12 @@ dtparam=audio=on
 # X1300 HDMI-zu-CSI bridge
 camera_auto_detect=0
 dtoverlay=tc358743,4lane=1
-dtoverlay=tc358743-audio
+#dtoverlay=tc358743-audio
 
 # VC4 driver and memory
-dtoverlay=vc4-kms-v3d,cma-512
+dtoverlay=vc4-kms-v3d
 media-controller=1
-gpu_mem=256
+gpu_mem=512
 ```
 
 ## Verwendung
