@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# X1300 / TC358743 Setup für OpenCV (Pi 5, Raspberry Pi OS/X11, kein GStreamer)
-# - Setzt EDID (pad=0), liest DV-Timings
-# - Verlinkt Media-Graph (csi2:4 -> rp1-cfe-csi2_ch0:0)
-# - BUS-Format auf RGB888_1X24 (CSI), Video-Node auf BGR3 (24 bpp)
-# Quellen/Anlehnung: Geekworm X1300 (Pi 5) + v4l2-ctl EDID pad=0
+# X1300 / TC358743 Setup – RGB-Ausgabe am Video-Node (RGB3, 24 bpp)
+# Pi 5, Raspberry Pi OS/X11, ohne GStreamer. OpenCV liest direkt aus /dev/videoX.
+# - EDID setzen (pad=0), DV-Timings abfragen
+# - Media-Graph verlinken (csi2:4 -> rp1-cfe-csi2_ch0:0)
+# - CSI-BUS-Format: RGB888_1X24
+# - Video-Node-Format: RGB3  (-> OpenCV bekommt RGB, nicht BGR)
+# Hinweis: Kernel 6.12.x hat teils R/B-Swap/Streaming-Issues mit tc358743. 6.6 LTS ist robuster.
 
 set -Eeuo pipefail
 export LC_ALL=C LANG=C
 
-# --------- Styling (ohne Funktionssyntax) ----------
+# ---------- Styling ----------
 if [ -t 1 ]; then
   BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; YEL=$'\e[33m'; GRN=$'\e[32m'; CLR=$'\e[0m'
 else
@@ -19,19 +21,19 @@ ok()  { printf "${GRN}[OK]${CLR} %s\n" "$*"; }
 warn(){ printf "${YEL}[WARN]${CLR} %s\n" "$*"; }
 err() { printf "${RED}[FATAL]${CLR} %s\n" "$*"; }
 
-# --------- Optionen ----------
+# ---------- Optionen ----------
 EDID_FILE="${EDID_FILE:-/tmp/X1300_EDID_1080P60.txt}"
 RETRIES="${RETRIES:-4}"
 SLEEP_S="${SLEEP_S:-0.3}"
 ENV_OUT="${ENV_OUT:-/tmp/x1300_env}"
 MD_LIMIT="${MD_LIMIT:-160}"
 
-# --------- Kernelinfo ----------
+# ---------- Kernelinfo ----------
 KREL="$(uname -r || true)"
 sec "[X1300] Kernel: $KREL"
 [[ "$KREL" =~ ^6\.12\. ]] && warn "Kernel 6.12.x auf Pi 5 ist für TC358743 anfällig. 6.6.x läuft stabiler."
 
-# --------- Geräte finden ----------
+# ---------- Geräte finden ----------
 SUBDEV=""
 for p in /sys/class/video4linux/v4l-subdev*; do
   [[ -r "$p/name" ]] || continue
@@ -60,7 +62,7 @@ echo "[X1300] Subdev: $SUBDEV"
 echo "[X1300] Video:  $VID"
 printf "%s\n" "------------------------------------------------------------"
 
-# --------- EDID-Datei (1080p60) ----------
+# ---------- EDID 1080p60 ----------
 if [ ! -s "$EDID_FILE" ]; then
   cat > "$EDID_FILE" <<'EOF'
 00ffffffffffff005262888800888888
@@ -83,21 +85,20 @@ EOF
   ok "EDID geschrieben: $EDID_FILE"
 fi
 
-# --------- EDID setzen (pad=0) ----------
+# ---------- EDID setzen (pad=0) ----------
 sec "[X1300] >> v4l2-ctl --set-edid"
 v4l2-ctl -d "$SUBDEV" --clear-edid 0 >/dev/null 2>&1 || true
 if ! v4l2-ctl -d "$SUBDEV" --set-edid=pad=0,file="$EDID_FILE",format=hex --fix-edid-checksums >/dev/null 2>&1; then
-  # Fallback ältere v4l2-utils
   v4l2-ctl -d "$SUBDEV" --set-edid="file=$EDID_FILE" --fix-edid-checksums >/dev/null 2>&1 || true
 fi
 v4l2-ctl -d "$SUBDEV" --info-edid 0 2>/dev/null | sed -n '1,60p' || true
 
-# --------- DV-Timings mehrfach abfragen ----------
+# ---------- DV-Timings mehrfach abfragen ----------
 W=0; H=0
 for i in $(seq 1 "$RETRIES"); do
   sleep "$SLEEP_S"
   if v4l2-ctl -d "$SUBDEV" --query-dv-timings >/tmp/_dv 2>&1; then
-    W=$(awk -F': *' '/Active width/ {print $2}' /tmp/_dv | head -n1)
+    W=$(awk -F': *' '/Active width/ {print $2}'  /tmp/_dv | head -n1)
     H=$(awk -F': *' '/Active height/ {print $2}' /tmp/_dv | head -n1)
     W=${W:-0}; H=${H:-0}
   fi
@@ -122,7 +123,7 @@ fi
 # Bestätigen (üblich in den Guides)
 v4l2-ctl -d "$SUBDEV" --set-dv-bt-timings query >/dev/null 2>&1 || true
 
-# --------- Media-Graph setzen ----------
+# ---------- Media-Graph & Formate ----------
 BUS_CODE="RGB888_1X24"
 ENTITY_NAME="$(media-ctl -d "$MD" -p | awk '/- entity .*tc358743/ {sub(/.*: /,""); print; exit}')"
 ENTITY_NAME="${ENTITY_NAME:-tc358743 11-000f}"
@@ -145,22 +146,21 @@ show && /pad[0-9]:/ {print}
 show && /->/ {print}
 ' | sed -n "1,${MD_LIMIT}p" || true
 
-# Achtung: Pattern beginnt mit '-' → grep nach '--'
 if ! media-ctl -d "$MD" -p | grep -Fq -- '-> "rp1-cfe-csi2_ch0":0 [ENABLED]'; then
   err "Link csi2:4 -> rp1-cfe-csi2_ch0:0 ist NICHT enabled."
   exit 3
 fi
 
-# --------- Video-Node auf BGR3 ----------
+# ---------- Video-Node auf RGB3 ----------
 printf "%s\n" "------------------------------------------------------------"
-echo "[X1300] Video-Node auf BGR3 ${W}x${H} setzen…"
-v4l2-ctl -d "$VID" -v width="$W",height="$H",pixelformat=BGR3 >/dev/null 2>&1 || true
+echo "[X1300] Video-Node auf RGB3 ${W}x${H} setzen…"
+v4l2-ctl -d "$VID" -v width="$W",height="$H",pixelformat=RGB3 >/dev/null 2>&1 || true
 echo "[X1300] --get-fmt-video:"; v4l2-ctl -d "$VID" --get-fmt-video || true
 echo "[X1300] --list-formats-ext (Auszug):"; v4l2-ctl -d "$VID" --list-formats-ext | sed -n '1,120p' || true
 
-# --------- 2-Frame-Test ----------
+# ---------- Kurzstream-Test ----------
 printf "%s\n" "------------------------------------------------------------"
-echo "[X1300] 2-Frame-Test (BGR3, verbose)…"
+echo "[X1300] 2-Frame-Test (RGB3, verbose)…"
 if v4l2-ctl --verbose -d "$VID" --stream-mmap=4 --stream-count=2 --stream-to=/dev/null --stream-poll >/dev/null 2>&1; then
   ok "Streamtest OK."
 else
@@ -171,18 +171,18 @@ else
   exit 4
 fi
 
-# --------- ENV-Datei für Python ----------
+# ---------- ENV für Python/OpenCV ----------
 cat > "$ENV_OUT" <<EOF
 VIDEO_NODE=$VID
 WIDTH=$W
 HEIGHT=$H
-PIXELFORMAT=BGR3
+PIXELFORMAT=RGB3
 EOF
 
 sec "[X1300] Setup OK."
 echo "[X1300]   Media     : $MD"
 echo "[X1300]   Subdev    : $SUBDEV"
 echo "[X1300]   VideoNode : $VID"
-echo "[X1300]   Size/Pix  : ${W}x${H} BGR3"
+echo "[X1300]   Size/Pix  : ${W}x${H} RGB3"
 echo "[X1300]   Env       : $ENV_OUT"
 exit 0
